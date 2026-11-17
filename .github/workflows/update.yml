@@ -1,0 +1,97 @@
+name: 데이터 수집 및 사이트 배포
+
+on:
+  schedule:
+    - cron: "23 * * * *"   # 매시 23분 (UTC)
+  workflow_dispatch:
+    inputs:
+      demo:
+        description: "API 키 없이 샘플(가짜) 데이터로 배포"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 패키지 설치
+        run: pip install -r collector/requirements.txt
+
+      - name: 저장된 게임 데이터 불러오기 (data 브랜치)
+        run: |
+          mkdir -p store
+          if git ls-remote --exit-code --heads origin data >/dev/null; then
+            git fetch --depth=1 origin data
+            git archive FETCH_HEAD | tar -x -C store
+          fi
+
+      - name: 수집 (키가 없으면 샘플 데이터)
+        env:
+          BS_API_TOKEN: ${{ secrets.BS_API_TOKEN }}
+          STORE_DIR: store
+          DEMO: ${{ inputs.demo || false }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          has_games() { [ -d store/games ] && [ -n "$(ls store/games 2>/dev/null)" ]; }
+          is_demo() { grep -q '"demo": true' store/meta.json 2>/dev/null; }
+          if [ "$DEMO" = "true" ] || { [ -z "$BS_API_TOKEN" ] && ! has_games; }; then
+            echo "샘플 데이터를 만듭니다 (API 키 없음 또는 샘플 모드 선택)"
+            python collector/make_demo.py
+          elif [ -n "$BS_API_TOKEN" ] && [ "$EVENT" != "push" ]; then
+            if is_demo; then
+              echo "샘플 데이터를 지우고 실제 수집으로 전환합니다"
+              rm -rf store/games store/meta.json store/demo_truth.json
+            fi
+            python collector/collect.py
+          else
+            echo "수집을 건너뜁니다 (코드 변경 배포)"
+          fi
+
+      - name: 집계
+        env:
+          STORE_DIR: store
+          OUT_FILE: site/data/stats.json
+        run: python collector/aggregate.py
+
+      - name: 게임 데이터 저장 (data 브랜치, 기록 1개만 유지)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd store
+          git init -q
+          git checkout -q -b data
+          git add -A
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -qm "data $(date -u +%FT%TZ)"
+          git push -qf "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" data
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
